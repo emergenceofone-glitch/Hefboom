@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Target, Zap } from 'lucide-react';
+import { Analytics } from '@vercel/analytics/react';
 
 interface Particle {
   id: number;
@@ -856,7 +857,7 @@ export default function App() {
         <div>Vector Balance Engine v1.0.8</div>
         <div className="text-slate-400/50">Status: {stateRef.current.isDragging ? 'Dragging' : 'Equilibrium'}</div>
       </div>
+      <Analytics />
     </div>
   );
 }
-
