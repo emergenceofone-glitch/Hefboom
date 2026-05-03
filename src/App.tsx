@@ -56,12 +56,20 @@ export default function App() {
     droneGain: null as GainNode | null,
     delayNode: null as DelayNode | null,
     delayFeedback: null as GainNode | null,
+    // Recording / Loop State
+    recordedEvents: [] as { timeOffset: number, freq: number, magnitude: number }[],
+    loopLength: 5000, // 5 second loop
+    loopStartTime: 0,
+    lastLoopCheck: 0,
     // Idle Animation State
     idleTime: 0,
     startPos: [] as { x: number, y: number }[],
     // Spectrum FX
     ghosts: [] as { x: number, y: number, r: number, hue: number, alpha: number }[],
     hueCycle: 0,
+    // New Interaction States
+    releaseDelay: 0,
+    isReleased: false,
   });
 
   const [motionActive, setMotionActive] = useState(false);
@@ -85,6 +93,7 @@ export default function App() {
 
     stateRef.current.delayNode = delay;
     stateRef.current.delayFeedback = feedback;
+    stateRef.current.loopStartTime = ctx.currentTime * 1000;
 
     setAudioEnabled(true);
   };
@@ -208,6 +217,32 @@ export default function App() {
       const state = stateRef.current;
       const { cx, cy, k, damping, baseR, anchors } = state;
 
+      // Update Loop Engine
+      if (state.audioCtx && state.audioCtx.state === 'running') {
+        const now = state.audioCtx.currentTime * 1000;
+        const relativeTime = (now - state.loopStartTime) % state.loopLength;
+        
+        // Find events that should play between lastLoopCheck and relativeTime
+        state.recordedEvents.forEach(event => {
+          // Normal loop check or wrap-around check
+          const play = (state.lastLoopCheck < event.timeOffset && relativeTime >= event.timeOffset) ||
+                       (state.lastLoopCheck > relativeTime && (event.timeOffset > state.lastLoopCheck || event.timeOffset <= relativeTime));
+          
+          if (play) {
+            playPluck(event.freq);
+            // Spawn a faint ghost ripple at cx, cy for loop visibility
+            state.ripples.push({
+              x: cx,
+              y: cy,
+              r: 20,
+              alpha: 0.3 * event.magnitude,
+              color: 'rgba(255, 255, 255, 0.1)'
+            });
+          }
+        });
+        state.lastLoopCheck = relativeTime;
+      }
+
       if (!state.isDragging) {
         state.idleTime += 16; // Approx 60fps increment
       } else {
@@ -310,25 +345,29 @@ export default function App() {
 
       // 3. Multi-Vector Physics
       if (!state.isDragging) {
-        anchors.forEach(anchor => {
-          const dx = anchor.x - state.x;
-          const dy = anchor.y - state.y;
-          state.vx += dx * k;
-          state.vy += dy * k;
-        });
+        if (state.releaseDelay > 0) {
+          state.releaseDelay -= 1;
+        } else {
+          anchors.forEach(anchor => {
+            const dx = anchor.x - state.x;
+            const dy = anchor.y - state.y;
+            state.vx += dx * k;
+            state.vy += dy * k;
+          });
 
-        const cdx = cx - state.x;
-        const cdy = cy - state.y;
-        state.vx += cdx * 0.05;
-        state.vy += cdy * 0.05;
+          const cdx = cx - state.x;
+          const cdy = cy - state.y;
+          state.vx += cdx * 0.05;
+          state.vy += cdy * 0.05;
 
-        state.vx += state.tilt.x * 0.6;
-        state.vy += state.tilt.y * 0.6;
+          state.vx += state.tilt.x * 0.6;
+          state.vy += state.tilt.y * 0.6;
 
-        state.vx *= damping;
-        state.vy *= damping;
-        state.x += state.vx;
-        state.y += state.vy;
+          state.vx *= damping;
+          state.vy *= damping;
+          state.x += state.vx;
+          state.y += state.vy;
+        }
       }
 
       // 4. Draw Vector Connections (Hefboom Strings)
@@ -422,23 +461,38 @@ export default function App() {
       state.idleTime = 0;
       state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       state.lastTapTime = Date.now();
+      state.isReleased = false;
+      state.releaseDelay = 0;
 
-      if (state.pointers.size === 1) {
-        const d = Math.hypot(e.clientX - state.x, e.clientY - state.y);
-        if (d < state.baseR * 2) {
-          state.isDragging = true;
-          state.vx = 0;
-          state.vy = 0;
-          state.maxDist = 0;
-          state.targetLightness = 60;
-          state.targetSaturation = 100;
-          state.hue = Math.random() * 360;
-          setIsInteractionActive(true);
-          startDrone();
-        }
-      } else if (state.pointers.size === 2) {
-        // Initialize pinch dist
-        const pts = Array.from(state.pointers.values()) as { x: number; y: number }[];
+      const pts = Array.from(state.pointers.values()) as { x: number; y: number }[];
+      const avgX = pts.reduce((sum, p) => sum + p.x, 0) / pts.length;
+      const avgY = pts.reduce((sum, p) => sum + p.y, 0) / pts.length;
+
+      // Make ball appear at input
+      if (!state.isDragging) {
+        state.x = avgX;
+        state.y = avgY;
+        state.isDragging = true;
+        state.vx = 0;
+        state.vy = 0;
+        state.maxDist = 0;
+        state.targetLightness = 60;
+        state.targetSaturation = 100;
+        setIsInteractionActive(true);
+        startDrone();
+        
+        // Spawn ripple
+        state.ripples.push({
+          x: state.x,
+          y: state.y,
+          r: 10,
+          alpha: 1,
+          color: '#fff'
+        });
+        playPluck(110);
+      }
+
+      if (state.pointers.size === 2) {
         state.initialPinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
         state.initialBaseR = state.baseR;
       }
@@ -450,19 +504,25 @@ export default function App() {
       if (!state.pointers.has(e.pointerId)) return;
       state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-      if (state.pointers.size === 1 && state.isDragging) {
-        state.x = e.clientX;
-        state.y = e.clientY;
+      if (state.isDragging) {
+        const pts = Array.from(state.pointers.values()) as { x: number; y: number }[];
+        const avgX = pts.reduce((sum, p) => sum + p.x, 0) / pts.length;
+        const avgY = pts.reduce((sum, p) => sum + p.y, 0) / pts.length;
+
+        state.x = avgX;
+        state.y = avgY;
+        
         const d = Math.hypot(state.x - state.cx, state.y - state.cy);
         state.maxDist = Math.max(state.maxDist, d);
         setMetrics(m => ({ ...m, input: Math.round(d) }));
         updateDrone(d);
-      } else if (state.pointers.size === 2) {
-        const pts = Array.from(state.pointers.values()) as { x: number; y: number }[];
-        const currentDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-        if (state.initialPinchDist > 0) {
-          const ratio = currentDist / state.initialPinchDist;
-          state.baseR = Math.min(150, Math.max(20, state.initialBaseR * ratio));
+
+        if (state.pointers.size === 2) {
+          const currentDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+          if (state.initialPinchDist > 0) {
+            const ratio = currentDist / state.initialPinchDist;
+            state.baseR = Math.min(150, Math.max(20, state.initialBaseR * ratio));
+          }
         }
       }
     };
@@ -475,31 +535,10 @@ export default function App() {
 
       state.pointers.delete(e.pointerId);
 
-      // Tap response
-      if (!wasDragging && pt && duration < 250) {
-        const d = Math.hypot(pt.x - state.x, pt.y - state.y);
-        if (d < state.baseR * 1.5) {
-          playPluck(330 + Math.random() * 220);
-          // Trigger Ripple
-          state.ripples.push({
-            x: state.x,
-            y: state.y,
-            r: 10,
-            alpha: 1,
-            color: `hsl(${Math.random() * 360}, 100%, 70%)`
-          });
-          // Small physics impulse
-          state.vx += (Math.random() - 0.5) * 20;
-          state.vy += (Math.random() - 0.5) * 20;
-          // Flash hue
-          state.hue = Math.random() * 360;
-          state.lightness = 70;
-          state.saturation = 100;
-        }
-      }
-
       if (state.pointers.size === 0 && wasDragging) {
         state.isDragging = false;
+        state.isReleased = true;
+        state.releaseDelay = 15; // Frames to wait before snapping
         stopDrone();
         
         // Add visual echo pulse on release
@@ -517,6 +556,24 @@ export default function App() {
         state.targetLightness = 25;
         state.targetSaturation = 0;
         
+        // Record event into loop
+        if (state.audioCtx) {
+          const now = state.audioCtx.currentTime * 1000;
+          const timeOffset = (now - state.loopStartTime) % state.loopLength;
+          const freq = 110 + (state.maxDist * 0.5);
+          
+          state.recordedEvents.push({
+            timeOffset,
+            freq,
+            magnitude: Math.min(1, state.maxDist / 400)
+          });
+          
+          // Limit buffer size to last 16 events
+          if (state.recordedEvents.length > 16) {
+            state.recordedEvents.shift();
+          }
+        }
+
         const finalVal = Math.round(state.maxDist);
         setMetrics(m => ({ input: m.input, output: finalVal }));
         
@@ -641,8 +698,8 @@ export default function App() {
           <div className="w-1 h-1 rounded-full bg-slate-800" />
           <span>Audio: <span className={audioEnabled ? "text-cyan-400" : "text-slate-600"}>{audioEnabled ? "ON" : "OFF"}</span></span>
         </div>
-        <div>Mode: Elastic Catapult</div>
-        <div className="animate-pulse">Status: {stateRef.current.isDragging ? 'Calibrating...' : 'Awaiting Interaction'}</div>
+        <div>Mode: Multi-Point Equilibrium</div>
+        <div className="animate-pulse">Status: {stateRef.current.isDragging ? 'Object Bound' : stateRef.current.releaseDelay > 0 ? 'Release Latency' : 'Awaiting Interface'}</div>
         <div className="flex gap-2 mt-2">
           {!motionActive && (
             <button 
@@ -652,12 +709,19 @@ export default function App() {
               Enable Motion
             </button>
           )}
-          {!audioEnabled && (
+          {!audioEnabled ? (
             <button 
               onClick={initAudio}
               className="pointer-events-auto px-3 py-1 bg-white/5 border border-white/10 hover:bg-white/10 transition-colors text-[9px]"
             >
               Enable Audio
+            </button>
+          ) : (
+            <button 
+              onClick={() => { stateRef.current.recordedEvents = []; }}
+              className="pointer-events-auto px-3 py-1 bg-white/5 border border-white/10 hover:text-red-400 transition-colors text-[9px]"
+            >
+              Clear Loop ({stateRef.current.recordedEvents.length})
             </button>
           )}
         </div>
@@ -667,8 +731,8 @@ export default function App() {
       <div className="absolute bottom-10 right-10 text-right text-[10px] text-slate-600 tracking-widest uppercase pointer-events-none flex flex-col gap-1">
         <div>Vector Balance Engine v1.0.6</div>
         <div>Pinch to Stretch Weight</div>
-        <div>Tilt to Shift Gravity</div>
-        <div className="text-cyan-400/50">Spectrum FX Enabled</div>
+        <div className={audioEnabled ? "text-cyan-400" : "text-slate-600"}>Loop Recording: {audioEnabled ? "Auto" : "Off"}</div>
+        <div className="text-cyan-400/50 text-[8px] animate-pulse">Sync: {Math.floor(stateRef.current.lastLoopCheck / 100)}ms</div>
       </div>
     </div>
   );
