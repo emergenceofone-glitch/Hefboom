@@ -42,8 +42,133 @@ export default function App() {
     k: 0.04, // Lowered per-anchor spring constant
     damping: 0.82,
     particles: [] as Particle[],
-    anchors: [] as { x: number, y: number }[]
+    anchors: [] as { x: number, y: number }[],
+    // Multi-touch & Motion state
+    pointers: new Map<number, { x: number, y: number }>(),
+    initialPinchDist: 0,
+    initialBaseR: 45,
+    tilt: { x: 0, y: 0 },
+    ripples: [] as { x: number, y: number, r: number, alpha: number, color: string }[],
+    lastTapTime: 0,
+    // Audio State
+    audioCtx: null as AudioContext | null,
+    droneOsc: null as OscillatorNode | null,
+    droneGain: null as GainNode | null,
+    delayNode: null as DelayNode | null,
+    delayFeedback: null as GainNode | null,
+    // Idle Animation State
+    idleTime: 0,
+    startPos: [] as { x: number, y: number }[],
+    // Spectrum FX
+    ghosts: [] as { x: number, y: number, r: number, hue: number, alpha: number }[],
+    hueCycle: 0,
   });
+
+  const [motionActive, setMotionActive] = useState(false);
+  const [audioEnabled, setAudioEnabled] = useState(false);
+
+  // Audio Synthesis Utilities
+  const initAudio = () => {
+    if (stateRef.current.audioCtx) return;
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    stateRef.current.audioCtx = ctx;
+
+    // Setup Delay Effect for Plucks
+    const delay = ctx.createDelay(1.0);
+    delay.delayTime.value = 0.25; // Quarter note-ish
+    const feedback = ctx.createGain();
+    feedback.gain.value = 0.4; // Feedback amount
+
+    delay.connect(feedback);
+    feedback.connect(delay);
+    delay.connect(ctx.destination);
+
+    stateRef.current.delayNode = delay;
+    stateRef.current.delayFeedback = feedback;
+
+    setAudioEnabled(true);
+  };
+
+  const playPluck = (freq: number = 220) => {
+    const ctx = stateRef.current.audioCtx;
+    if (!ctx || ctx.state === 'suspended') return;
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const filter = ctx.createBiquadFilter();
+
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.5, ctx.currentTime + 0.2);
+
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(2000, ctx.currentTime);
+    filter.frequency.exponentialRampToValueAtTime(100, ctx.currentTime + 0.2);
+
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+
+    // Connect to delay line
+    if (stateRef.current.delayNode) {
+      gain.connect(stateRef.current.delayNode);
+    }
+
+    osc.start();
+    osc.stop(ctx.currentTime + 0.3);
+  };
+
+  const startDrone = () => {
+    const ctx = stateRef.current.audioCtx;
+    if (!ctx || ctx.state === 'suspended' || stateRef.current.droneOsc) return;
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const filter = ctx.createBiquadFilter();
+
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(110, ctx.currentTime);
+
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(400, ctx.currentTime);
+
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.1, ctx.currentTime + 0.1);
+
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start();
+    stateRef.current.droneOsc = osc;
+    stateRef.current.droneGain = gain;
+  };
+
+  const updateDrone = (dist: number) => {
+    const { droneOsc, droneGain, audioCtx } = stateRef.current;
+    if (!droneOsc || !droneGain || !audioCtx) return;
+
+    const freq = 110 + (dist * 0.5);
+    const volume = Math.min(0.2, (dist / 300) * 0.2);
+    
+    droneOsc.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.05);
+    droneGain.gain.setTargetAtTime(volume, audioCtx.currentTime, 0.1);
+  };
+
+  const stopDrone = () => {
+    const { droneOsc, droneGain, audioCtx } = stateRef.current;
+    if (!droneOsc || !droneGain || !audioCtx) return;
+
+    droneGain.gain.cancelScheduledValues(audioCtx.currentTime);
+    droneGain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.2);
+    droneOsc.stop(audioCtx.currentTime + 0.2);
+
+    stateRef.current.droneOsc = null;
+    stateRef.current.droneGain = null;
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -68,6 +193,7 @@ export default function App() {
         { x: 40, y: h - 40 },      // Bottom Left
         { x: w - 40, y: h - 40 }   // Bottom Right
       ];
+      state.startPos = [...state.anchors];
 
       if (state.x === 0) {
         state.x = state.cx;
@@ -78,9 +204,15 @@ export default function App() {
     window.addEventListener('resize', handleResize);
     handleResize();
 
-    const animate = () => {
+    const animate = (time: number) => {
       const state = stateRef.current;
       const { cx, cy, k, damping, baseR, anchors } = state;
+
+      if (!state.isDragging) {
+        state.idleTime += 16; // Approx 60fps increment
+      } else {
+        state.idleTime = 0;
+      }
 
       // 1. Clear & Draw Background Grid
       ctx.fillStyle = '#0A0A0F';
@@ -97,23 +229,80 @@ export default function App() {
       }
       ctx.stroke();
 
-      // 2. Draw Corner Hook UI
-      anchors.forEach(anchor => {
+      // Draw Ripples
+      state.ripples = state.ripples.map(r => ({
+        ...r,
+        r: r.r + 4,
+        alpha: r.alpha - 0.03
+      })).filter(r => r.alpha > 0);
+
+      state.ripples.forEach(r => {
+        ctx.save();
+        ctx.strokeStyle = r.color;
+        ctx.globalAlpha = Math.max(0, r.alpha);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      });
+
+      // Update Hue & Spectrum Ghosts
+      if (state.isDragging) {
+        state.hueCycle = (state.hueCycle + 2) % 360;
+        state.hue = state.hueCycle;
+      }
+      
+      const speed = Math.hypot(state.vx, state.vy);
+      if (speed > 10 || (state.isDragging && speed > 2)) {
+        state.ghosts.push({
+          x: state.x,
+          y: state.y,
+          r: state.baseR,
+          hue: state.hue,
+          alpha: 0.5
+        });
+      }
+      
+      state.ghosts = state.ghosts.map(g => ({
+        ...g,
+        alpha: g.alpha - 0.04,
+        r: g.r * 0.99
+      })).filter(g => g.alpha > 0);
+
+      state.ghosts.forEach(g => {
+        ctx.save();
+        ctx.fillStyle = `hsla(${g.hue}, 100%, 70%, ${g.alpha})`;
+        ctx.beginPath();
+        ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      });
+
+      // 2. Draw Corner Hook UI with Idle Drift
+      const isIdle = state.idleTime > 2000;
+      anchors.forEach((anchor, i) => {
+        if (isIdle && !state.isDragging && state.startPos[i]) {
+          const driftX = Math.sin(time * 0.001 + i) * 10;
+          const driftY = Math.cos(time * 0.0012 + i) * 10;
+          anchor.x += (state.startPos[i].x + driftX - anchor.x) * 0.05;
+          anchor.y += (state.startPos[i].y + driftY - anchor.y) * 0.05;
+        }
+
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        // Corner bracket style
         const size = 15;
         const offsetX = anchor.x < cx ? 1 : -1;
         const offsetY = anchor.y < cy ? 1 : -1;
-        
         ctx.moveTo(anchor.x, anchor.y + size * offsetY);
         ctx.lineTo(anchor.x, anchor.y);
         ctx.lineTo(anchor.x + size * offsetX, anchor.y);
         ctx.stroke();
 
-        // Glowing node in the corner hook
-        ctx.fillStyle = state.isDragging ? 'rgba(34, 211, 238, 0.4)' : 'rgba(255, 255, 255, 0.1)';
+        ctx.fillStyle = (state.isDragging || (isIdle && Math.sin(time * 0.005 + i) > 0)) 
+          ? 'rgba(34, 211, 238, 0.4)' 
+          : 'rgba(255, 255, 255, 0.1)';
         ctx.beginPath();
         ctx.arc(anchor.x, anchor.y, 4, 0, Math.PI * 2);
         ctx.fill();
@@ -121,7 +310,6 @@ export default function App() {
 
       // 3. Multi-Vector Physics
       if (!state.isDragging) {
-        // Sum of forces from all 4 anchors
         anchors.forEach(anchor => {
           const dx = anchor.x - state.x;
           const dy = anchor.y - state.y;
@@ -129,11 +317,13 @@ export default function App() {
           state.vy += dy * k;
         });
 
-        // Add a slight centering force to ensure a stable equilibrium
         const cdx = cx - state.x;
         const cdy = cy - state.y;
         state.vx += cdx * 0.05;
         state.vy += cdy * 0.05;
+
+        state.vx += state.tilt.x * 0.6;
+        state.vy += state.tilt.y * 0.6;
 
         state.vx *= damping;
         state.vy *= damping;
@@ -146,9 +336,10 @@ export default function App() {
       const angle = Math.atan2(state.y - cy, state.x - cx);
 
       ctx.save();
-      anchors.forEach(anchor => {
-        const opacity = state.isDragging ? 0.3 : 0.05;
-        ctx.strokeStyle = state.isDragging ? `rgba(34, 211, 238, ${opacity})` : `rgba(255, 255, 255, ${opacity})`;
+      anchors.forEach((anchor, i) => {
+        const opacity = state.isDragging ? 0.4 : 0.05;
+        const lineHue = (state.hueCycle + i * 40) % 360;
+        ctx.strokeStyle = state.isDragging ? `hsla(${lineHue}, 100%, 70%, ${opacity})` : `rgba(255, 255, 255, ${opacity})`;
         ctx.lineWidth = state.isDragging ? 1.5 : 1;
         ctx.setLineDash([5, 5]);
         ctx.beginPath();
@@ -161,10 +352,14 @@ export default function App() {
       // 5. Smooth Color Transitions
       state.lightness += (state.targetLightness - state.lightness) * 0.1;
       state.saturation += (state.targetSaturation - state.saturation) * 0.1;
-      const highlightColor = state.isDragging ? 'rgb(34, 211, 238)' : 'rgb(245, 245, 245)';
+      
+      const pulse = isIdle ? Math.sin(time * 0.003) * 10 : 0;
+      const highlightColor = state.isDragging 
+        ? `hsl(${state.hueCycle}, 100%, 70%)` 
+        : `rgb(${245 + pulse}, ${245 + pulse}, ${245 + pulse})`;
       
       ctx.save();
-      ctx.shadowBlur = state.isDragging ? 40 : 15;
+      ctx.shadowBlur = state.isDragging ? 50 : (15 + (isIdle ? (Math.sin(time * 0.003) + 1) * 10 : 0));
       ctx.shadowColor = highlightColor;
       ctx.fillStyle = highlightColor;
 
@@ -190,7 +385,7 @@ export default function App() {
         ctx.fill();
       } else {
         ctx.beginPath();
-        ctx.arc(cx, cy, baseR, 0, Math.PI * 2);
+        ctx.arc(cx, cy, baseR + (isIdle ? Math.sin(time * 0.002) * 2 : 0), 0, Math.PI * 2);
         ctx.fill();
       }
 
@@ -224,41 +419,107 @@ export default function App() {
 
     const handlePointerDown = (e: PointerEvent) => {
       const state = stateRef.current;
-      const d = Math.hypot(e.clientX - state.x, e.clientY - state.y);
-      if (d < state.baseR * 2) {
-        state.isDragging = true;
-        state.vx = 0;
-        state.vy = 0;
-        state.maxDist = 0;
-        state.targetLightness = 60;
-        state.targetSaturation = 100;
-        setIsInteractionActive(true);
-        // Do not reset output immediately if user wants to see their last score
+      state.idleTime = 0;
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      state.lastTapTime = Date.now();
+
+      if (state.pointers.size === 1) {
+        const d = Math.hypot(e.clientX - state.x, e.clientY - state.y);
+        if (d < state.baseR * 2) {
+          state.isDragging = true;
+          state.vx = 0;
+          state.vy = 0;
+          state.maxDist = 0;
+          state.targetLightness = 60;
+          state.targetSaturation = 100;
+          state.hue = Math.random() * 360;
+          setIsInteractionActive(true);
+          startDrone();
+        }
+      } else if (state.pointers.size === 2) {
+        // Initialize pinch dist
+        const pts = Array.from(state.pointers.values()) as { x: number; y: number }[];
+        state.initialPinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        state.initialBaseR = state.baseR;
       }
     };
 
     const handlePointerMove = (e: PointerEvent) => {
       const state = stateRef.current;
-      if (state.isDragging) {
+      state.idleTime = 0;
+      if (!state.pointers.has(e.pointerId)) return;
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (state.pointers.size === 1 && state.isDragging) {
         state.x = e.clientX;
         state.y = e.clientY;
         const d = Math.hypot(state.x - state.cx, state.y - state.cy);
         state.maxDist = Math.max(state.maxDist, d);
         setMetrics(m => ({ ...m, input: Math.round(d) }));
+        updateDrone(d);
+      } else if (state.pointers.size === 2) {
+        const pts = Array.from(state.pointers.values()) as { x: number; y: number }[];
+        const currentDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        if (state.initialPinchDist > 0) {
+          const ratio = currentDist / state.initialPinchDist;
+          state.baseR = Math.min(150, Math.max(20, state.initialBaseR * ratio));
+        }
       }
     };
 
-    const handlePointerUp = () => {
+    const handlePointerUp = (e: PointerEvent) => {
       const state = stateRef.current;
-      if (state.isDragging) {
+      const wasDragging = state.isDragging;
+      const duration = Date.now() - state.lastTapTime;
+      const pt = state.pointers.get(e.pointerId);
+
+      state.pointers.delete(e.pointerId);
+
+      // Tap response
+      if (!wasDragging && pt && duration < 250) {
+        const d = Math.hypot(pt.x - state.x, pt.y - state.y);
+        if (d < state.baseR * 1.5) {
+          playPluck(330 + Math.random() * 220);
+          // Trigger Ripple
+          state.ripples.push({
+            x: state.x,
+            y: state.y,
+            r: 10,
+            alpha: 1,
+            color: `hsl(${Math.random() * 360}, 100%, 70%)`
+          });
+          // Small physics impulse
+          state.vx += (Math.random() - 0.5) * 20;
+          state.vy += (Math.random() - 0.5) * 20;
+          // Flash hue
+          state.hue = Math.random() * 360;
+          state.lightness = 70;
+          state.saturation = 100;
+        }
+      }
+
+      if (state.pointers.size === 0 && wasDragging) {
         state.isDragging = false;
+        stopDrone();
+        
+        // Add visual echo pulse on release
+        const releaseMag = Math.min(50, state.maxDist / 5);
+        for(let i = 0; i < 6; i++) {
+          state.ghosts.push({
+            x: state.x + (Math.random() - 0.5) * releaseMag,
+            y: state.y + (Math.random() - 0.5) * releaseMag,
+            r: state.baseR * (1 + i * 0.1),
+            hue: (state.hueCycle + i * 15) % 360,
+            alpha: 0.8 - (i * 0.1)
+          });
+        }
+
         state.targetLightness = 25;
         state.targetSaturation = 0;
         
         const finalVal = Math.round(state.maxDist);
         setMetrics(m => ({ input: m.input, output: finalVal }));
         
-        // Reset input visual after a short delay
         setTimeout(() => setMetrics(m => ({ ...m, input: 0 })), 500);
 
         if (finalVal > 20) {
@@ -274,11 +535,46 @@ export default function App() {
           });
         }
       }
+
+      if (state.pointers.size < 2) {
+        state.initialPinchDist = 0;
+      }
     };
+
+    const handleOrientation = (e: DeviceOrientationEvent) => {
+      if (e.beta !== null && e.gamma !== null) {
+        stateRef.current.tilt = {
+          x: e.gamma / 10,
+          y: e.beta / 10
+        };
+      }
+    };
+
+    const enableMotion = async () => {
+      if (typeof (DeviceOrientationEvent as any).requestPermission === 'function') {
+        try {
+          const response = await (DeviceOrientationEvent as any).requestPermission();
+          if (response === 'granted') {
+            setMotionActive(true);
+            window.addEventListener('deviceorientation', handleOrientation);
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      } else {
+        setMotionActive(true);
+        window.addEventListener('deviceorientation', handleOrientation);
+      }
+    };
+    (window as any).enableMotion = enableMotion; // Expose for the button
 
     window.addEventListener('pointerdown', handlePointerDown);
     window.addEventListener('pointermove', handlePointerMove);
     window.addEventListener('pointerup', handlePointerUp);
+    // Don't auto-add orientation until enabled/granted on iOS
+    if (typeof (DeviceOrientationEvent as any).requestPermission !== 'function') {
+       window.addEventListener('deviceorientation', handleOrientation);
+    }
 
     const animationId = requestAnimationFrame(animate);
 
@@ -288,6 +584,7 @@ export default function App() {
       window.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('deviceorientation', handleOrientation);
     };
   }, []);
 
@@ -336,16 +633,42 @@ export default function App() {
       </div>
 
       {/* Footer Left */}
-      <div className="absolute bottom-10 left-10 text-[10px] text-slate-600 tracking-widest uppercase flex flex-col gap-1 pointer-events-none">
-        <div>System: <span className={isInteractionActive ? "text-cyan-500" : "text-slate-600"}>Active</span></div>
+      <div className="absolute bottom-10 left-10 text-[10px] text-slate-600 tracking-widest uppercase flex flex-col gap-2 pointer-events-none">
+        <div className="flex items-center gap-3">
+          <span>System: <span className={isInteractionActive ? "text-cyan-500" : "text-slate-600"}>Active</span></span>
+          <div className="w-1 h-1 rounded-full bg-slate-800" />
+          <span>Motion: <span className={motionActive ? "text-fuchsia-500" : "text-slate-600"}>{motionActive ? "ON" : "OFF"}</span></span>
+          <div className="w-1 h-1 rounded-full bg-slate-800" />
+          <span>Audio: <span className={audioEnabled ? "text-cyan-400" : "text-slate-600"}>{audioEnabled ? "ON" : "OFF"}</span></span>
+        </div>
         <div>Mode: Elastic Catapult</div>
         <div className="animate-pulse">Status: {stateRef.current.isDragging ? 'Calibrating...' : 'Awaiting Interaction'}</div>
+        <div className="flex gap-2 mt-2">
+          {!motionActive && (
+            <button 
+              onClick={() => (window as any).enableMotion?.()}
+              className="pointer-events-auto px-3 py-1 bg-white/5 border border-white/10 hover:bg-white/10 transition-colors text-[9px]"
+            >
+              Enable Motion
+            </button>
+          )}
+          {!audioEnabled && (
+            <button 
+              onClick={initAudio}
+              className="pointer-events-auto px-3 py-1 bg-white/5 border border-white/10 hover:bg-white/10 transition-colors text-[9px]"
+            >
+              Enable Audio
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Footer Right */}
-      <div className="absolute bottom-10 right-10 text-right text-[10px] text-slate-600 tracking-widest uppercase pointer-events-none">
-        <div>Vector Balance Engine v1.0.4</div>
-        <div>Measured Energy Equivalent</div>
+      <div className="absolute bottom-10 right-10 text-right text-[10px] text-slate-600 tracking-widest uppercase pointer-events-none flex flex-col gap-1">
+        <div>Vector Balance Engine v1.0.6</div>
+        <div>Pinch to Stretch Weight</div>
+        <div>Tilt to Shift Gravity</div>
+        <div className="text-cyan-400/50">Spectrum FX Enabled</div>
       </div>
     </div>
   );
