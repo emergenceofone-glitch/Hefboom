@@ -18,12 +18,25 @@ interface Particle {
   vy: number;
 }
 
+interface SavedLoop {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  hue: number;
+  events: { timeOffset: number, freq: number, magnitude: number }[];
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [metrics, setMetrics] = useState({ input: 0, output: 0 });
   const [isInteractionActive, setIsInteractionActive] = useState(false);
-  
-  // Physics & State refs to avoid closure staleness in the loop
+  const [savedLoops, setSavedLoops] = useState<SavedLoop[]>([]);
+  const savedLoopsRef = useRef<SavedLoop[]>([]);
+
+  useEffect(() => {
+    savedLoopsRef.current = savedLoops;
+  }, [savedLoops]);
   const stateRef = useRef({
     cx: 0,
     cy: 0,
@@ -58,7 +71,6 @@ export default function App() {
     delayFeedback: null as GainNode | null,
     // Recording / Loop State
     recordedEvents: [] as { timeOffset: number, freq: number, magnitude: number }[],
-    savedLoops: [] as { id: string, x: number, y: number, hue: number, events: { timeOffset: number, freq: number, magnitude: number }[] }[],
     loopLength: 5000, // 5 second loop
     loopStartTime: 0,
     lastLoopCheck: 0,
@@ -248,7 +260,7 @@ export default function App() {
         });
 
         // 2. Play saved loops
-        state.savedLoops.forEach(loop => {
+        savedLoopsRef.current.forEach(loop => {
           loop.events.forEach(event => {
             const play = (state.lastLoopCheck < event.timeOffset && relativeTime >= event.timeOffset) ||
                          (state.lastLoopCheck > relativeTime && (event.timeOffset > state.lastLoopCheck || event.timeOffset <= relativeTime));
@@ -280,7 +292,7 @@ export default function App() {
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
       // Draw Saved Loop Blobs
-      state.savedLoops.forEach(loop => {
+      savedLoopsRef.current.forEach(loop => {
         const osc = Math.sin(time * 0.003) * 3;
         ctx.save();
         ctx.shadowBlur = 20;
@@ -759,6 +771,33 @@ export default function App() {
           ))}
         </div>
 
+        {savedLoops.length > 0 && (
+          <div className="pt-3 border-t border-white/5 space-y-2">
+            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">Saved Loops</span>
+            <div className="space-y-1">
+              {savedLoops.map(loop => (
+                <div key={loop.id} className="flex gap-2 items-center">
+                  <input 
+                    value={loop.name}
+                    onChange={(e) => {
+                      setSavedLoops(savedLoops.map(l => l.id === loop.id ? {...l, name: e.target.value} : l));
+                    }}
+                    className="flex-1 bg-white/5 py-1 px-2 text-[9px] text-white focus:outline-none focus:bg-white/10"
+                  />
+                  <button 
+                    onClick={() => {
+                      setSavedLoops(savedLoops.filter(l => l.id !== loop.id));
+                    }}
+                    className="text-red-400 hover:text-red-300 transition-colors text-[9px]"
+                  >
+                    DEL
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="pt-3 border-t border-white/5 space-y-3">
           {!motionActive && (
             <button 
@@ -783,13 +822,14 @@ export default function App() {
                   onClick={() => {
                     const state = stateRef.current;
                     if (state.recordedEvents.length > 0) {
-                      state.savedLoops.push({
+                      setSavedLoops([...savedLoops, {
                         id: Math.random().toString(36).substr(2, 9),
+                        name: `Loop ${savedLoops.length + 1}`,
                         x: 100 + Math.random() * (window.innerWidth - 200),
                         y: 100 + Math.random() * (window.innerHeight - 200),
                         hue: state.hueCycle,
                         events: [...state.recordedEvents]
-                      });
+                      }]);
                       state.recordedEvents = [];
                       setMetrics(m => ({...m}));
                     }
@@ -799,7 +839,7 @@ export default function App() {
                   Capture Loop
                 </button>
                 <button 
-                  onClick={() => { stateRef.current.recordedEvents = []; stateRef.current.savedLoops = []; setMetrics(m => ({...m})); }}
+                  onClick={() => { stateRef.current.recordedEvents = []; setSavedLoops([]); setMetrics(m => ({...m})); }}
                   className="w-full py-2 bg-white/5 border border-white/10 hover:bg-red-500/20 transition-all text-[9px] uppercase tracking-widest"
                 >
                   Clear All
