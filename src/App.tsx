@@ -90,10 +90,14 @@ export default function App() {
     // New Interaction States
     releaseDelay: 0,
     isReleased: false,
+    hasChimed: false, // Initialize chime flag
+    currentInput: 0,
+    lastOutput: 0,
   });
 
   const [motionActive, setMotionActive] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
 
   const handleOrientation = (e: DeviceOrientationEvent) => {
     if (e.beta !== null && e.gamma !== null) {
@@ -189,6 +193,57 @@ export default function App() {
     osc.stop(ctx.currentTime + 0.3);
   };
 
+  const playSnap = () => {
+    const ctx = stateRef.current.audioCtx;
+    if (!ctx || ctx.state === 'suspended') return;
+
+    const bufferSize = ctx.sampleRate * 0.1; // 100ms
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+        data[i] = Math.random() * 2 - 1;
+    }
+
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'highpass';
+    filter.frequency.value = 1000;
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.2, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.1);
+
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+
+    noise.start();
+    noise.stop(ctx.currentTime + 0.1);
+  };
+
+  const playChime = () => {
+    const ctx = stateRef.current.audioCtx;
+    if (!ctx || ctx.state === 'suspended') return;
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, ctx.currentTime); // High pitch A
+
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.2, ctx.currentTime + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1.0);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start();
+    osc.stop(ctx.currentTime + 1.0);
+  };
+
   const startDrone = () => {
     const ctx = stateRef.current.audioCtx;
     if (!ctx || ctx.state === 'suspended' || stateRef.current.droneOsc) return;
@@ -275,6 +330,16 @@ export default function App() {
     const animate = (time: number) => {
       const state = stateRef.current;
       const { cx, cy, k, damping, baseR, anchors } = state;
+
+      // Chime check
+      if (state.isDragging && state.lastOutput > 0 && Math.abs(state.currentInput - state.lastOutput) < 5) {
+          if (!state.hasChimed) {
+              playChime();
+              state.hasChimed = true;
+          }
+      } else if (!state.isDragging) {
+          state.hasChimed = false;
+      }
 
       // Update Loop Engine
       if (state.audioCtx && state.audioCtx.state === 'running') {
@@ -631,6 +696,7 @@ export default function App() {
         
         const d = Math.hypot(state.x - state.cx, state.y - state.cy);
         state.maxDist = Math.max(state.maxDist, d);
+        state.currentInput = Math.round(d); // Track current input
         setMetrics(m => ({ ...m, input: Math.round(d) }));
         updateDrone(d);
 
@@ -656,6 +722,7 @@ export default function App() {
         state.isReleased = true;
         state.releaseDelay = 15; // Frames to wait before snapping
         stopDrone();
+        playSnap(); // Add snap sound
         
         // Add visual echo pulse on release
         const releaseMag = Math.min(50, state.maxDist / 5);
@@ -709,6 +776,7 @@ export default function App() {
         }
         
         const finalVal = Math.round(state.maxDist);
+        state.lastOutput = finalVal; // Track output
         setMetrics(m => ({ ...m, input: 0, output: finalVal }));
 
         if (finalVal > 20) {
@@ -756,142 +824,31 @@ export default function App() {
         className="absolute inset-0 cursor-crosshair z-0"
       />
 
-      {/* Control Panel (Reactive Position) */}
-      <motion.div 
-        animate={{ 
-          x: stateRef.current.isDragging && stateRef.current.x < 350 && stateRef.current.y > (window.innerHeight - 350) ? 50 : 0,
-        }}
-        className="absolute bottom-10 left-10 p-5 bg-black/40 backdrop-blur-xl border border-white/5 flex flex-col gap-5 pointer-events-auto z-50 min-w-[220px]"
-      >
-        <div className="flex items-center justify-between border-b border-white/5 pb-3">
-          <span className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">FX Matrix</span>
-          <div className="flex gap-1.5">
-            <div className={`w-1.5 h-1.5 rounded-full ${audioEnabled ? 'bg-cyan-500 shadow-[0_0_8px_rgba(34,211,238,0.5)]' : 'bg-slate-800'}`} />
-            <div className={`w-1.5 h-1.5 rounded-full ${stateRef.current.recordedEvents.length > 0 ? 'bg-fuchsia-500 animate-pulse' : 'bg-slate-800'}`} />
-          </div>
-        </div>
-
-        <div className="space-y-4">
-          {[
-            { label: 'Elasticity', key: 'k', min: 0.005, max: 0.1, step: 0.001, tooltip: 'Adjusts the spring tension of the audio plucks' },
-            { label: 'Damping', key: 'damping', min: 0.7, max: 0.99, step: 0.01, tooltip: 'Controls how fast the sound decays' },
-            { label: 'Spectrum', key: 'spectrumIntensity', min: 0, max: 2, step: 0.1, tooltip: 'Sets the visual intensity of the frequency spectrum' },
-          ].map(slider => (
-            <div key={slider.key} className="space-y-1.5 group relative">
-              <div className="flex justify-between text-[9px] text-slate-400 uppercase tracking-tighter">
-                <span>{slider.label}</span>
-                <span className="text-cyan-500 font-mono">{(stateRef.current as any)[slider.key].toFixed(3)}</span>
-              </div>
-              
-              <div className="absolute -left-2 -top-8 bg-black/80 text-cyan-200 py-1 px-2 rounded text-[8px] whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 border border-white/10 shadow-xl font-sans">
-                {slider.tooltip}
-              </div>
-
-              <input 
-                type="range"
-                min={slider.min}
-                max={slider.max}
-                step={slider.step}
-                defaultValue={(stateRef.current as any)[slider.key]}
-                onChange={(e) => {
-                  (stateRef.current as any)[slider.key] = parseFloat(e.target.value);
-                  setMetrics(m => ({ ...m })); 
-                }}
-                className="w-full h-1 bg-slate-800 appearance-none rounded-full accent-cyan-500 cursor-pointer"
-              />
-            </div>
-          ))}
-        </div>
-
-        {savedLoops.length > 0 && (
-          <div className="pt-3 border-t border-white/5 space-y-2">
-            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">Saved Loops</span>
-            <div className="space-y-1">
-              {savedLoops.map(loop => (
-                <div key={loop.id} className="flex gap-2 items-center">
-                  <input 
-                    value={loop.name}
-                    onChange={(e) => {
-                      setSavedLoops(savedLoops.map(l => l.id === loop.id ? {...l, name: e.target.value} : l));
-                    }}
-                    className="flex-1 bg-white/5 py-1 px-2 text-[9px] text-white focus:outline-none focus:bg-white/10"
-                  />
-                  <button 
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setSavedLoops(savedLoops.filter(l => l.id !== loop.id));
-                    }}
-                    className="text-red-400 hover:text-red-300 transition-colors text-[9px]"
-                  >
-                    DEL
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <div className="pt-3 border-t border-white/5 space-y-3">
-          <button 
-            onClick={(e) => {
-              e.stopPropagation();
-              enableMotion();
-            }}
-            className={`w-full py-2 border transition-all text-[9px] uppercase tracking-widest ${motionActive ? 'bg-fuchsia-500/20 border-fuchsia-500/50 text-fuchsia-400' : 'bg-white/5 border-white/10 hover:bg-fuchsia-500/20'}`}
-          >
-            {motionActive ? 'Motion Active' : 'Enable Motion'}
-          </button>
-
+      {/* DAW Header/Transport */}
+      <div className="absolute top-4 left-4 right-4 z-50 p-3 bg-black/60 backdrop-blur-md border border-white/10 flex justify-between items-center pointer-events-auto">
+          <h1 className="text-sm font-bold tracking-widest">GEMINI DAW</h1>
           <div className="flex gap-2">
-            {!audioEnabled ? (
-              <button 
-                onClick={(e) => {
-                  e.stopPropagation();
-                  initAudio();
-                }}
-                className="flex-1 py-2 bg-white/5 border border-white/10 hover:bg-cyan-500/20 transition-all text-[9px] uppercase tracking-widest"
-              >
-                Audio Eng
+              <button onClick={() => setIsPlaying(!isPlaying)} className="px-4 py-1.5 bg-cyan-900/50 hover:bg-cyan-800 border border-cyan-500/30 text-xs">
+                  {isPlaying ? "STOP" : "PLAY"}
               </button>
-            ) : (
-              <div className="flex flex-col w-full gap-2">
-                <button 
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const state = stateRef.current;
-                    if (state.recordedEvents.length > 0) {
-                      setSavedLoops([...savedLoops, {
-                        id: Math.random().toString(36).substr(2, 9),
-                        name: `Loop ${savedLoops.length + 1}`,
-                        x: 100 + Math.random() * (window.innerWidth - 200),
-                        y: 100 + Math.random() * (window.innerHeight - 200),
-                        hue: state.hueCycle,
-                        events: [...state.recordedEvents]
-                      }]);
-                      state.recordedEvents = [];
-                      setMetrics(m => ({...m}));
-                    }
-                  }}
-                  className="w-full py-2 bg-cyan-500/10 border border-cyan-500/20 hover:bg-cyan-500/30 transition-all text-[9px] uppercase tracking-widest text-cyan-400"
-                >
-                  Capture Loop
-                </button>
-                <button 
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    stateRef.current.recordedEvents = []; 
-                    setSavedLoops([]); 
-                    setMetrics(m => ({...m})); 
-                  }}
-                  className="w-full py-2 bg-white/5 border border-white/10 hover:bg-red-500/20 transition-all text-[9px] uppercase tracking-widest"
-                >
-                  Clear All
-                </button>
-              </div>
-            )}
           </div>
-        </div>
-      </motion.div>
+      </div>
+      
+      {/* DAW Main Workspace */}
+      <div className="absolute top-20 left-4 bottom-28 right-4 z-40 flex gap-4 pointer-events-none">
+          <div className="w-64 bg-black/60 backdrop-blur-md border border-white/10 p-4 pointer-events-auto">
+              <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">Tracks</h2>
+          </div>
+          <div className="flex-1 bg-black/60 backdrop-blur-md border border-white/10 p-4 pointer-events-auto">
+              <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">Sequencer</h2>
+          </div>
+      </div>
+      
+      {/* DAW Mixer */}
+      <div className="absolute bottom-4 left-4 right-4 h-20 z-40 bg-black/60 backdrop-blur-md border border-white/10 p-3 pointer-events-auto">
+           <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-2">Mixer</h2>
+           {/* Mixer Channels */}
+      </div>
 
       {/* Primary Metrics HUD */}
       <motion.div 
